@@ -159,12 +159,15 @@ def cmd_xlsx_check(args: argparse.Namespace) -> int:
                 if not any(v is not None for v in row_vals):
                     continue
                 for c in range(3, 10):
+                    cell = ws_f.cell(r, c)
+                    if isinstance(cell, openpyxl.cell.cell.MergedCell):
+                        continue
                     checked_numeric_cells += 1
-                    val = ws_f.cell(r, c).value
+                    val = cell.value
                     if val is None or (isinstance(val, str) and val.strip() == ""):
                         empty_violations.append({
                             "sheet": sname,
-                            "cell": ws_f.cell(r, c).coordinate,
+                            "cell": cell.coordinate,
                             "row_label": str(ws_f.cell(r, 2).value or ws_f.cell(r, 1).value),
                             "col_header": str(ws_f.cell(2, c).value or f"Col{c}"),
                             "reason": "周报数值列留空（应填 0）",
@@ -182,12 +185,15 @@ def cmd_xlsx_check(args: argparse.Namespace) -> int:
                 # 检查 G 列（达成情况）与最新当期月度列 S 列（10月，col 19）
                 core_cols = [7, 19] if not is_total_row else list(range(6, 20))
                 for c in core_cols:
+                    cell = ws_f.cell(r, c)
+                    if isinstance(cell, openpyxl.cell.cell.MergedCell):
+                        continue
                     checked_numeric_cells += 1
-                    val = ws_f.cell(r, c).value
+                    val = cell.value
                     if val is None or (isinstance(val, str) and val.strip() == ""):
                         empty_violations.append({
                             "sheet": sname,
-                            "cell": ws_f.cell(r, c).coordinate,
+                            "cell": cell.coordinate,
                             "row_label": str(ws_f.cell(r, 3).value or first_val),
                             "col_header": str(ws_f.cell(2, c).value or f"Col{c}"),
                             "reason": "台账核心达成列/当期列留空（无数据应填 0）",
@@ -196,7 +202,10 @@ def cmd_xlsx_check(args: argparse.Namespace) -> int:
                 if not is_total_row:
                     started = False
                     for c in range(9, 20):
-                        v = ws_f.cell(r, c).value
+                        cell = ws_f.cell(r, c)
+                        if isinstance(cell, openpyxl.cell.cell.MergedCell):
+                            continue
+                        v = cell.value
                         if v is not None and str(v).strip() != "":
                             started = True
                             checked_numeric_cells += 1
@@ -204,7 +213,7 @@ def cmd_xlsx_check(args: argparse.Namespace) -> int:
                             checked_numeric_cells += 1
                             empty_violations.append({
                                 "sheet": sname,
-                                "cell": ws_f.cell(r, c).coordinate,
+                                "cell": cell.coordinate,
                                 "row_label": str(ws_f.cell(r, 3).value or first_val),
                                 "col_header": str(ws_f.cell(2, c).value or f"Col{c}"),
                                 "reason": "连续月度数值区出现断档空格（左右有数中间留空）",
@@ -215,7 +224,10 @@ def cmd_xlsx_check(args: argparse.Namespace) -> int:
             if ws_f.max_row >= 3 and ws_f.max_column >= 2:
                 for r in range(3, ws_f.max_row + 1):
                     for c in range(2, ws_f.max_column + 1):
-                        v = ws_f.cell(r, c).value
+                        cell = ws_f.cell(r, c)
+                        if isinstance(cell, openpyxl.cell.cell.MergedCell):
+                            continue
+                        v = cell.value
                         if is_number_or_formula(v):
                             checked_numeric_cells += 1
 
