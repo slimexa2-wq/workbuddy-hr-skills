@@ -54,7 +54,7 @@ def parse_single_policy_file(fpath: str):
                         s = str(v).strip()
                         if ID_RE.match(s):
                             row_id = s.upper()
-                        elif not row_name and 2 <= len(s) <= 5 and all("\u4e00" <= c <= "\u9fff" for c in s):
+                        elif not row_name and bool(re.match(r"^[\u4e00-\u9fa5\·]{2,15}$", s)):
                             row_name = s
                     if row_id or row_name:
                         data_dict = {
@@ -92,7 +92,7 @@ def parse_single_policy_file(fpath: str):
                         s = fmt_val(v)
                         if ID_RE.match(s):
                             row_id = s.upper()
-                        elif not row_name and 2 <= len(s) <= 5 and all("\u4e00" <= c <= "\u9fff" for c in s):
+                        elif not row_name and bool(re.match(r"^[\u4e00-\u9fa5\·]{2,15}$", s)):
                             row_name = s
                     if row_id or row_name:
                         data_dict = {

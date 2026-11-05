@@ -55,7 +55,7 @@ def extract_targets(batch_dir: str):
                         s = str(v).strip()
                         if ID_RE.match(s):
                             target_ids.add(s.upper())
-                        elif 2 <= len(s) <= 5 and all("\u4e00" <= c <= "\u9fff" for c in s):
+                        elif bool(re.match(r"^[\u4e00-\u9fa5\·]{2,15}$", s)):
                             target_names.add(s)
             wb.close()
         else:
@@ -67,7 +67,7 @@ def extract_targets(batch_dir: str):
                         s = str(sh.cell_value(r, c)).strip()
                         if ID_RE.match(s):
                             target_ids.add(s.upper())
-                        elif 2 <= len(s) <= 5 and all("\u4e00" <= c <= "\u9fff" for c in s):
+                        elif bool(re.match(r"^[\u4e00-\u9fa5\·]{2,15}$", s)):
                             target_names.add(s)
     return target_ids, target_names
 
@@ -94,7 +94,7 @@ def scan_policy_worker(args):
                     s = str(v).strip()
                     if ID_RE.match(s):
                         row_id = s.upper()
-                    elif not row_name and 2 <= len(s) <= 5 and all("\u4e00" <= c <= "\u9fff" for c in s):
+                    elif not row_name and bool(re.match(r"^[\u4e00-\u9fa5\·]{2,15}$", s)):
                         row_name = s
                 if (row_id and row_id in target_ids) or (row_name and row_name in target_names):
                     rec = {
