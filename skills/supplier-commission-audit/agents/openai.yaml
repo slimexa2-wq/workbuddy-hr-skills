@@ -1,0 +1,4 @@
+interface:
+  display_name: "供应商提成审核"
+  short_description: "按项目公式核验四类原始依据，只复核问题项，并在原表追加审核结果"
+  default_prompt: "使用 $supplier-commission-audit 审核本期供应商提成，沿用已有通过结论，按各项目公式复核问题项，并在原表副本追加审核依据和结果。"

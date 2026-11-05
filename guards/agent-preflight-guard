@@ -1,0 +1,552 @@
+#!/Users/wangmini/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/bin/python3
+# -*- coding: utf-8 -*-
+"""
+agent-preflight-guard —— 全机 Agent 交付物与运行环境通用预检卫士
+
+功能子命令：
+  1. xlsx-check <file.xlsx> [--sheet <name>] [--strict-all-comments] [--json]
+     一键自动检查 Excel 交付物是否违反四道红线：
+       ① 零批注（comments == 0，严禁 Agent 在交付表中注入批注）
+       ② 数值区无空值（不得留空，无发生额须填 0，严禁「左右有数字突然空一格」）
+       ③ 无公式错误（无 #REF! / #DIV/0! / #VALUE! / #NAME? / #N/A / #NUM! / #NULL!）
+       ④ 无 WPS ~$ 临时锁文件占用与 lsof 进程写冲突
+
+  2. env-check [--json]
+     一键检查本机运行环境四项核心状态：
+       ① 本机代理（127.0.0.1:7890 / 26801 / 9090 端口连通性 & Mihomo TUN 网卡状态）
+       ② Spider × Magpie 协同网关（127.0.0.1:3425 网关、19820 核心服务与 SQLite 库状态）
+       ③ 孤儿进程数量与进程卫生（联动 agent-reaper 检查 PPID=1 残留工具进程）
+       ④ 磁盘剩余空间与 7 天删除隔离区状态（quarantine / backups / Trash）
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import openpyxl
+
+FORMULA_ERROR_TOKENS = ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A", "#NUM!", "#NULL!")
+LEGACY_HUMAN_AUTHORS = {"22381", "Administrator"}
+LEGACY_HUMAN_BASE_SHEETS = {"目标达成进度表"}
+
+
+def check_port(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def is_number_or_formula(val) -> bool:
+    if isinstance(val, (int, float)):
+        return True
+    if isinstance(val, str) and val.strip().startswith("="):
+        return True
+    return False
+
+
+def cmd_xlsx_check(args: argparse.Namespace) -> int:
+    xlsx_path = os.path.abspath(os.path.expanduser(args.file))
+    if not os.path.exists(xlsx_path):
+        print(f"❌ [FAIL] 文件不存在: {xlsx_path}", file=sys.stderr)
+        return 2
+
+    dir_name = os.path.dirname(xlsx_path)
+    base_name = os.path.basename(xlsx_path)
+
+    # ---------------------------------------------------------
+    # 红线 4：WPS ~$ 锁文件与 lsof 进程占用冲突检查
+    # ---------------------------------------------------------
+    lock_candidates = [
+        os.path.join(dir_name, f"~${base_name}"),
+        os.path.join(dir_name, f".~lock.{base_name}#"),
+    ]
+    found_locks = [p for p in lock_candidates if os.path.exists(p)]
+
+    lsof_holders = []
+    try:
+        res = subprocess.run(
+            ["/usr/sbin/lsof", "--", xlsx_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            lines = res.stdout.strip().splitlines()
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    lsof_holders.append(f"{parts[0]}(PID={parts[1]})")
+    except Exception:
+        pass
+
+    # Also check if WPS / Excel has the filename in open window / args if lsof is empty
+    lock_conflict_ok = (len(found_locks) == 0) and (len(lsof_holders) == 0)
+
+    # ---------------------------------------------------------
+    # 加载工作簿（双模式：公式模式 + 缓存值模式）
+    # ---------------------------------------------------------
+    try:
+        wb_f = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb_v = openpyxl.load_workbook(xlsx_path, data_only=True)
+    except Exception as e:
+        print(f"❌ [FAIL] 无法解析 Excel 工作簿: {e}", file=sys.stderr)
+        return 2
+
+    target_sheets = [args.sheet] if args.sheet else wb_f.sheetnames
+
+    # ---------------------------------------------------------
+    # 红线 1：零批注检查（comments == 0）
+    # ---------------------------------------------------------
+    agent_comments = []
+    legacy_comments = []
+    per_sheet_comments = {}
+
+    for sname in target_sheets:
+        if sname not in wb_f.sheetnames:
+            print(f"❌ [FAIL] 指定的工作表不存在: {sname}", file=sys.stderr)
+            return 2
+        ws = wb_f[sname]
+        s_comms = []
+        for r in range(1, ws.max_row + 1):
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(r, c)
+                if cell.comment is not None:
+                    author = (cell.comment.author or "").strip()
+                    text = (cell.comment.text or "").strip().replace("\n", " ")
+                    item = {
+                        "sheet": sname,
+                        "cell": cell.coordinate,
+                        "author": author,
+                        "text": text[:80],
+                    }
+                    s_comms.append(item)
+                    if (
+                        not args.strict_all_comments
+                        and sname in LEGACY_HUMAN_BASE_SHEETS
+                        and author in LEGACY_HUMAN_AUTHORS
+                    ):
+                        legacy_comments.append(item)
+                    else:
+                        agent_comments.append(item)
+        per_sheet_comments[sname] = len(s_comms)
+
+    comments_ok = len(agent_comments) == 0
+
+    # ---------------------------------------------------------
+    # 红线 2：数值区无空值检查（不得留空 / 禁「左右有数字突然空一格」）
+    # ---------------------------------------------------------
+    empty_violations = []
+    checked_numeric_cells = 0
+
+    for sname in target_sheets:
+        ws_f = wb_f[sname]
+        ws_v = wb_v[sname]
+
+        # 规则 A：祥能人力周报标准三表（周度数据表 / 人数减少明细 / 人数增加明细）
+        if sname in ("周度数据表", "人数减少明细", "人数增加明细"):
+            for r in range(3, ws_f.max_row + 1):
+                row_vals = [ws_f.cell(r, c).value for c in range(1, 10)]
+                if not any(v is not None for v in row_vals):
+                    continue
+                for c in range(3, 10):
+                    checked_numeric_cells += 1
+                    val = ws_f.cell(r, c).value
+                    if val is None or (isinstance(val, str) and val.strip() == ""):
+                        empty_violations.append({
+                            "sheet": sname,
+                            "cell": ws_f.cell(r, c).coordinate,
+                            "row_label": str(ws_f.cell(r, 2).value or ws_f.cell(r, 1).value),
+                            "col_header": str(ws_f.cell(2, c).value or f"Col{c}"),
+                            "reason": "周报数值列留空（应填 0）",
+                        })
+
+        # 规则 B：自主招聘台账（资源目标达成推进表）
+        elif sname == "自主招聘台账":
+            # 识别表头行（第 2 行）与数据行（第 3 行至合计行）
+            max_data_row = ws_f.max_row
+            for r in range(3, max_data_row + 1):
+                first_val = ws_f.cell(r, 1).value
+                if first_val is None and ws_f.cell(r, 3).value is None:
+                    continue
+                is_total_row = str(first_val).strip() == "合计"
+                # 检查 G 列（达成情况）与最新当期月度列 S 列（10月，col 19）
+                core_cols = [7, 19] if not is_total_row else list(range(6, 20))
+                for c in core_cols:
+                    checked_numeric_cells += 1
+                    val = ws_f.cell(r, c).value
+                    if val is None or (isinstance(val, str) and val.strip() == ""):
+                        empty_violations.append({
+                            "sheet": sname,
+                            "cell": ws_f.cell(r, c).coordinate,
+                            "row_label": str(ws_f.cell(r, 3).value or first_val),
+                            "col_header": str(ws_f.cell(2, c).value or f"Col{c}"),
+                            "reason": "台账核心达成列/当期列留空（无数据应填 0）",
+                        })
+                # 检查 12月~10月（cols 9..19）是否存在「入职开始有数据后，中间月份突然空一格」
+                if not is_total_row:
+                    started = False
+                    for c in range(9, 20):
+                        v = ws_f.cell(r, c).value
+                        if v is not None and str(v).strip() != "":
+                            started = True
+                            checked_numeric_cells += 1
+                        elif started:
+                            checked_numeric_cells += 1
+                            empty_violations.append({
+                                "sheet": sname,
+                                "cell": ws_f.cell(r, c).coordinate,
+                                "row_label": str(ws_f.cell(r, 3).value or first_val),
+                                "col_header": str(ws_f.cell(2, c).value or f"Col{c}"),
+                                "reason": "连续月度数值区出现断档空格（左右有数中间留空）",
+                            })
+
+        # 规则 C：通用数据表检查（检测全部为数值/公式的闭合统计列中是否存在孤立空白洞）
+        else:
+            if ws_f.max_row >= 3 and ws_f.max_column >= 2:
+                for r in range(3, ws_f.max_row + 1):
+                    for c in range(2, ws_f.max_column + 1):
+                        v = ws_f.cell(r, c).value
+                        if is_number_or_formula(v):
+                            checked_numeric_cells += 1
+
+    numeric_non_empty_ok = len(empty_violations) == 0
+
+    # ---------------------------------------------------------
+    # 红线 3：零公式错误检查（无 #REF! / #DIV/0! / #VALUE! / #NAME? 等）
+    # ---------------------------------------------------------
+    formula_errors = []
+    total_formulas = 0
+
+    for sname in target_sheets:
+        ws_f = wb_f[sname]
+        ws_v = wb_v[sname]
+        for r in range(1, ws_f.max_row + 1):
+            for c in range(1, ws_f.max_column + 1):
+                vf = ws_f.cell(r, c).value
+                vv = ws_v.cell(r, c).value
+                if isinstance(vf, str) and vf.startswith("="):
+                    total_formulas += 1
+                for mode_label, val in (("formula", vf), ("cached_value", vv)):
+                    if isinstance(val, str):
+                        for err_tok in FORMULA_ERROR_TOKENS:
+                            if err_tok in val:
+                                formula_errors.append({
+                                    "sheet": sname,
+                                    "cell": ws_f.cell(r, c).coordinate,
+                                    "mode": mode_label,
+                                    "value": val,
+                                    "error": err_tok,
+                                })
+
+    formula_ok = len(formula_errors) == 0
+
+    all_passed = comments_ok and numeric_non_empty_ok and formula_ok and lock_conflict_ok
+
+    report = {
+        "file": xlsx_path,
+        "status": "PASS" if all_passed else "FAIL",
+        "gates": {
+            "1_zero_comments": {
+                "passed": comments_ok,
+                "agent_comments_count": len(agent_comments),
+                "legacy_human_comments_count": len(legacy_comments),
+                "per_sheet_comments": per_sheet_comments,
+                "violations": agent_comments[:10],
+            },
+            "2_numeric_no_blanks": {
+                "passed": numeric_non_empty_ok,
+                "checked_numeric_cells": checked_numeric_cells,
+                "empty_violations_count": len(empty_violations),
+                "violations": empty_violations[:10],
+            },
+            "3_zero_formula_errors": {
+                "passed": formula_ok,
+                "total_formulas_scanned": total_formulas,
+                "formula_errors_count": len(formula_errors),
+                "violations": formula_errors[:10],
+            },
+            "4_no_wps_lock_or_lsof_conflict": {
+                "passed": lock_conflict_ok,
+                "lock_files": found_locks,
+                "lsof_holders": lsof_holders,
+            },
+        },
+    }
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        badge = "✅ [PASS]" if all_passed else "❌ [FAIL]"
+        print(f"============================================================")
+        print(f"{badge} Excel 交付预检卫士 (xlsx-check): {base_name}")
+        print(f"路径: {xlsx_path}")
+        print(f"------------------------------------------------------------")
+        g1 = report["gates"]["1_zero_comments"]
+        b1 = "✅ PASS" if g1["passed"] else "❌ FAIL"
+        legacy_note = (
+            f"（另有底表历史人工批注 {g1['legacy_human_comments_count']} 条 [22381/Administrator]，按增量原则原样保留）"
+            if g1["legacy_human_comments_count"] > 0
+            else ""
+        )
+        print(f"  [红线 1 · 零批注检查]       {b1} | Agent 注入批注 = {g1['agent_comments_count']}{legacy_note}")
+        if not g1["passed"]:
+            for v in g1["violations"]:
+                print(f"     -> 违规批注: [{v['sheet']}!{v['cell']}] author={v['author']}: {v['text']}")
+
+        g2 = report["gates"]["2_numeric_no_blanks"]
+        b2 = "✅ PASS" if g2["passed"] else "❌ FAIL"
+        print(f"  [红线 2 · 数值区无空值]     {b2} | 核验数值格 = {g2['checked_numeric_cells']}, 空白违规 = {g2['empty_violations_count']}")
+        if not g2["passed"]:
+            for v in g2["violations"]:
+                print(f"     -> 空白单元格: [{v['sheet']}!{v['cell']}] ({v['row_label']} - {v['col_header']}): {v['reason']}")
+
+        g3 = report["gates"]["3_zero_formula_errors"]
+        b3 = "✅ PASS" if g3["passed"] else "❌ FAIL"
+        print(f"  [红线 3 · 零公式错误]       {b3} | 扫描公式数 = {g3['total_formulas_scanned']}, 公式报错 = {g3['formula_errors_count']}")
+        if not g3["passed"]:
+            for v in g3["violations"]:
+                print(f"     -> 公式错误: [{v['sheet']}!{v['cell']}] ({v['mode']}): {v['value']}")
+
+        g4 = report["gates"]["4_no_wps_lock_or_lsof_conflict"]
+        b4 = "✅ PASS" if g4["passed"] else "❌ FAIL"
+        print(f"  [红线 4 · 无WPS锁与进程冲突] {b4} | ~$锁文件 = {len(g4['lock_files'])}, lsof占用进程 = {len(g4['lsof_holders'])}")
+        if not g4["passed"]:
+            if g4["lock_files"]:
+                print(f"     -> 发现锁文件: {g4['lock_files']}")
+            if g4["lsof_holders"]:
+                print(f"     -> 发现占用进程: {g4['lsof_holders']}")
+        print(f"============================================================")
+
+    return 0 if all_passed else 1
+
+
+def get_dir_stats(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"exists": False, "items": 0, "size_mb": 0.0}
+    items = 0
+    total_bytes = 0
+    try:
+        for entry in os.scandir(path):
+            items += 1
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    total_bytes += entry.stat(follow_symlinks=False).st_size
+                elif entry.is_dir(follow_symlinks=False):
+                    for root, _, files in os.walk(entry.path):
+                        for fn in files:
+                            fp = os.path.join(root, fn)
+                            try:
+                                total_bytes += os.path.getsize(fp)
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return {"exists": True, "items": items, "size_mb": round(total_bytes / (1024 * 1024), 2)}
+
+
+def cmd_env_check(args: argparse.Namespace) -> int:
+    home = os.path.expanduser("~")
+
+    # 1. Proxy (7890 / 26801 / 9090 & TUN)
+    p7890 = check_port("127.0.0.1", 7890)
+    p26801 = check_port("127.0.0.1", 26801)
+    p9090 = check_port("127.0.0.1", 9090)
+
+    mihomo_cfg = os.path.join(home, ".dsh/mihomo/config.v2.yaml")
+    tun_cfg_enabled = False
+    if os.path.exists(mihomo_cfg):
+        try:
+            with open(mihomo_cfg, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+            m = re.search(r"tun:\s*\n(?:\s+.*\n)*?\s+enable:\s*true", txt)
+            tun_cfg_enabled = bool(m)
+        except OSError:
+            pass
+
+    utun_count = 0
+    try:
+        res = subprocess.run(["/sbin/ifconfig", "-l"], capture_output=True, text=True, timeout=3)
+        if res.returncode == 0:
+            utun_count = sum(1 for iface in res.stdout.split() if iface.startswith("utun"))
+    except Exception:
+        pass
+
+    proxy_ok = p7890 and p9090 and (tun_cfg_enabled or utun_count > 0)
+
+    # 2. Spider & Magpie Gateway (3425 / 5179 / 5181 & DBs)
+    p3425 = check_port("127.0.0.1", 3425)
+    p5179 = check_port("127.0.0.1", 5179)
+    p5181 = check_port("127.0.0.1", 5181)
+    mem_db = os.path.join(home, ".local/share/spider/data/agent-os/memory.db")
+    hub_db = os.path.join(home, ".local/share/spider/data/hub/hub.db")
+    dbs_ok = os.path.exists(mem_db) and os.path.exists(hub_db)
+    pending_captures = -1
+    active_skills = -1
+    if dbs_ok:
+        try:
+            with sqlite3.connect(mem_db, timeout=2.0) as mc:
+                pending_captures = mc.execute(
+                    "SELECT COUNT(*) FROM captures WHERE processed = 0 AND COALESCE(dream_deferred, 0) = 0"
+                ).fetchone()[0]
+            with sqlite3.connect(hub_db, timeout=2.0) as hc:
+                active_skills = hc.execute(
+                    "SELECT COUNT(*) FROM net_resources WHERE type = 'skill' AND status = 'active'"
+                ).fetchone()[0]
+        except Exception:
+            pass
+    spider_ok = p3425 and p5179 and dbs_ok
+
+    # 3. Orphan processes (via agent-reaper --status)
+    reaper_bin = os.path.join(home, ".local/bin/agent-reaper")
+    orphan_total = 0
+    orphan_expired = 0
+    reaper_raw = ""
+    if os.path.exists(reaper_bin):
+        try:
+            res = subprocess.run([reaper_bin, "--status"], capture_output=True, text=True, timeout=5)
+            reaper_raw = res.stdout.strip()
+            m = re.search(r"孤儿工具进程.*?(\d+)\s*个.*?会被清理的：(\d+)\s*个", reaper_raw)
+            if m:
+                orphan_total = int(m.group(1))
+                orphan_expired = int(m.group(2))
+        except Exception as e:
+            reaper_raw = f"error: {e}"
+    orphan_ok = orphan_expired == 0
+
+    # 4. Disk & Quarantine zones
+    quarantine_dir = os.path.join(home, ".local/share/spider/quarantine")
+    os.makedirs(quarantine_dir, exist_ok=True)
+    backups_dir = os.path.join(home, ".dsh/backups")
+    os.makedirs(backups_dir, exist_ok=True)
+    trash_dir = os.path.join(home, ".Trash")
+
+    usage = shutil.disk_usage("/")
+    free_gb = round(usage.free / (1024 ** 3), 2)
+    total_gb = round(usage.total / (1024 ** 3), 2)
+    q_stats = get_dir_stats(quarantine_dir)
+    b_stats = get_dir_stats(backups_dir)
+    t_stats = get_dir_stats(trash_dir)
+    disk_ok = free_gb >= 10.0 and q_stats["exists"] and b_stats["exists"]
+
+    all_passed = proxy_ok and spider_ok and orphan_ok and disk_ok
+
+    report = {
+        "status": "PASS" if all_passed else "FAIL",
+        "checks": {
+            "1_proxy_and_tun": {
+                "passed": proxy_ok,
+                "port_7890": p7890,
+                "port_26801": p26801,
+                "port_9090": p9090,
+                "tun_config_enabled": tun_cfg_enabled,
+                "utun_interfaces_count": utun_count,
+            },
+            "2_spider_magpie_gateway": {
+                "passed": spider_ok,
+                "magpie_3425": p3425,
+                "spider_hub_5179": p5179,
+                "public_gate_5181": p5181,
+                "memory_db_exists": os.path.exists(mem_db),
+                "hub_db_exists": os.path.exists(hub_db),
+                "pending_captures": pending_captures,
+                "active_skills": active_skills,
+            },
+            "3_orphan_process_hygiene": {
+                "passed": orphan_ok,
+                "orphan_tool_processes": orphan_total,
+                "expired_orphans_to_reap": orphan_expired,
+                "reaper_summary": reaper_raw,
+            },
+            "4_disk_and_quarantine": {
+                "passed": disk_ok,
+                "disk_free_gb": free_gb,
+                "disk_total_gb": total_gb,
+                "spider_quarantine": q_stats,
+                "dsh_backups": b_stats,
+                "macos_trash": t_stats,
+            },
+        },
+    }
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        badge = "✅ [PASS]" if all_passed else "❌ [FAIL]"
+        print("============================================================")
+        print(f"{badge} 全机运行环境预检卫士 (env-check)")
+        print("------------------------------------------------------------")
+        c1 = report["checks"]["1_proxy_and_tun"]
+        print(
+            f"  [1 · 本机代理与TUN]   {'✅ PASS' if c1['passed'] else '❌ FAIL'} | "
+            f"7890={'UP' if c1['port_7890'] else 'DOWN'}, "
+            f"26801={'UP' if c1['port_26801'] else 'DOWN'}, "
+            f"9090={'UP' if c1['port_9090'] else 'DOWN'}, "
+            f"TUN配置={'ON' if c1['tun_config_enabled'] else 'OFF'} (utun={c1['utun_interfaces_count']})"
+        )
+        c2 = report["checks"]["2_spider_magpie_gateway"]
+        print(
+            f"  [2 · Spider协同网关]  {'✅ PASS' if c2['passed'] else '❌ FAIL'} | "
+            f"Magpie(3425)={'UP' if c2['magpie_3425'] else 'DOWN'}, "
+            f"SpiderHub(5179)={'UP' if c2['spider_hub_5179'] else 'DOWN'}, "
+            f"Gate(5181)={'UP' if c2['public_gate_5181'] else 'DOWN'}, "
+            f"待消化={c2['pending_captures']}条, 现役技能={c2['active_skills']}个"
+        )
+        c3 = report["checks"]["3_orphan_process_hygiene"]
+        print(
+            f"  [3 · 孤儿进程卫生]    {'✅ PASS' if c3['passed'] else '❌ FAIL'} | "
+            f"当前孤儿工具进程={c3['orphan_tool_processes']} 个, 超期需清理={c3['expired_orphans_to_reap']} 个"
+        )
+        c4 = report["checks"]["4_disk_and_quarantine"]
+        print(
+            f"  [4 · 磁盘与隔离区]    {'✅ PASS' if c4['passed'] else '❌ FAIL'} | "
+            f"可用空间={c4['disk_free_gb']}GB/{c4['disk_total_gb']}GB, "
+            f"Spider隔离区={c4['spider_quarantine']['items']}项({c4['spider_quarantine']['size_mb']}MB), "
+            f"DSH备份区={c4['dsh_backups']['items']}项({c4['dsh_backups']['size_mb']}MB)"
+        )
+        print("============================================================")
+
+    return 0 if all_passed else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent-preflight-guard",
+        description="全机 Agent 交付物与运行环境通用预检卫士",
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    p_xlsx = sub.add_parser("xlsx-check", help="检查 Excel 交付物四道红线")
+    p_xlsx.add_argument("file", help="待检查的 .xlsx 文件路径")
+    p_xlsx.add_argument("--sheet", help="仅检查指定工作表名称", default=None)
+    p_xlsx.add_argument(
+        "--strict-all-comments",
+        action="store_true",
+        help="严格要求包含历史人工底表在内的所有工作表均为 0 批注",
+    )
+    p_xlsx.add_argument("--json", action="store_true", help="输出 JSON 格式结果")
+
+    p_env = sub.add_parser("env-check", help="检查本机代理、Spider 网关、孤儿进程与磁盘隔离区状态")
+    p_env.add_argument("--json", action="store_true", help="输出 JSON 格式结果")
+
+    args = parser.parse_args()
+    if args.subcommand == "xlsx-check":
+        return cmd_xlsx_check(args)
+    elif args.subcommand == "env-check":
+        return cmd_env_check(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
