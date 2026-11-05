@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
+from image_preflight import process_image, render_pdf
 
 NS = {
     'wpc': "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
@@ -64,42 +65,12 @@ def w10_tag(name):
 
 def get_image_size_and_normalize(img_path, work_dir, idx, rotate=0):
     """获取图片宽高，处理 EXIF 方向或指定旋转角度，输出标准 png/jpg 到 work_dir"""
-    ext = os.path.splitext(img_path)[1].lower()
-    if ext not in ['.png', '.jpg', '.jpeg']:
-        ext = '.png'
-    out_name = f"image{idx}{ext}"
-    out_path = os.path.join(work_dir, out_name)
-    shutil.copy2(img_path, out_path)
-
-    if rotate in [90, 180, 270]:
-        subprocess.run(['/usr/bin/sips', '-r', str(rotate), out_path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    res = subprocess.run(['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', out_path],
-                         capture_output=True, text=True)
-    w, h = 500, 700
-    for line in res.stdout.splitlines():
-        if 'pixelWidth:' in line:
-            w = int(line.split(':')[1].strip())
-        elif 'pixelHeight:' in line:
-            h = int(line.split(':')[1].strip())
-    return out_name, out_path, w, h
+    return process_image(img_path, work_dir, idx, rotate=rotate)
 
 
 def render_pdf_to_images(pdf_path, temp_dir, scale=2.0):
     """使用内置原生 pdf2png 工具将 PDF 每一页渲染为高清 PNG"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    pdf2png_bin = os.path.join(script_dir, 'pdf2png')
-    pdf2png_swift = os.path.join(script_dir, 'pdf2png.swift')
-    if not os.path.exists(pdf2png_bin) and os.path.exists(pdf2png_swift):
-        subprocess.run(['/usr/bin/swiftc', '-O', pdf2png_swift, '-o', pdf2png_bin], check=True)
-
-    out_sub = os.path.join(temp_dir, os.path.basename(pdf_path) + "_pages")
-    os.makedirs(out_sub, exist_ok=True)
-    res = subprocess.run([pdf2png_bin, pdf_path, out_sub, str(scale)],
-                         capture_output=True, text=True, check=True)
-    pages = [line.strip() for line in res.stdout.splitlines() if line.strip() and os.path.exists(line.strip())]
-    return sorted(pages)
+    return render_pdf(pdf_path, temp_dir, scale=scale)
 
 
 def calc_display_pt(w_px, h_px, mode='full_page', custom_w=None, custom_h=None):
