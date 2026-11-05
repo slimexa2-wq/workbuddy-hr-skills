@@ -3,3 +3,6 @@ __pycache__/
 venv/
 venv
 venv/
+*.json\n*.xlsx
+*.json
+*.xlsx
