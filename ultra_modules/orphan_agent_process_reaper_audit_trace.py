@@ -1,5 +1,8 @@
 import logging
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import datetime
 
 logger = logging.getLogger(__name__)

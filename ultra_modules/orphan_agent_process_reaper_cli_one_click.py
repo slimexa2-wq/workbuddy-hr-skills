@@ -1,7 +1,10 @@
 import json
 import logging
 import os
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import datetime
 
 try:

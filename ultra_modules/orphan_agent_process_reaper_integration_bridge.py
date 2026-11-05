@@ -1,5 +1,8 @@
 import os
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import logging
 from typing import Dict, Any, List, Optional
 import signal
