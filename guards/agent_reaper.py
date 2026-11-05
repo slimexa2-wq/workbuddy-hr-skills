@@ -56,6 +56,9 @@ DEFAULT_CONFIG = {
         "/.dsh/mihomo/",
         "mihomo",
         "/.local/share/agent-reaper/",
+        "vscode-server",
+        "cursor-server",
+        "jetbrains",
     ],
 }
 
@@ -215,10 +218,7 @@ def is_tool_process(cmd):
     return bool(TOOL_NAMES.match(name)) or bool(HEADLESS_HINT.search(cmd))
 
 
-def descendants(procs, root):
-    children = {}
-    for p in procs.values():
-        children.setdefault(p["ppid"], []).append(p["pid"])
+def descendants(children, root):
     result, stack = [], [root]
     while stack:
         cur = stack.pop()
@@ -241,6 +241,11 @@ def find_orphans(procs, cfg):
     whitelist = set(cfg.get("whitelist_patterns", [])) | launch_agent_whitelist()
     protected = ancestors(procs, SELF_PID)
     min_age = int(cfg["orphan_min_age_min"]) * 60
+
+    children = {}
+    for p in procs.values():
+        children.setdefault(p["ppid"], []).append(p["pid"])
+
     found = []
     for p in procs.values():
         if p["uid"] != UID or p["ppid"] != 1:
@@ -253,7 +258,18 @@ def find_orphans(procs, cfg):
             continue
         if any(w in p["cmd"] for w in whitelist):
             continue
-        tree = descendants(procs, p["pid"])
+        tree = descendants(children, p["pid"])
+
+        # False-kill protection: do not reap if any descendant is a non-tool process
+        # that is not in the tool name regex and not a headless browser.
+        all_descendants_tools = True
+        for c in tree:
+            if c in procs and not is_tool_process(procs[c]["cmd"]):
+                all_descendants_tools = False
+                break
+        if not all_descendants_tools:
+            continue
+
         found.append({
             "proc": p,
             "tree": tree,
